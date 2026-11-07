@@ -136,7 +136,7 @@ class Software:
     def status_label(self) -> str:
         return {
             "installed": "已安装",
-            "unregistered": "未登记",
+            "unregistered": "未发现入口",
             "residual": "疑似残留",
         }.get(self.status, self.status)
 
@@ -423,7 +423,12 @@ def collect_pacman(home: Path) -> list[Software]:
     result: list[Software] = []
     for name, info in infos.items():
         group = "AUR/本地包" if name in foreign else "官方仓库"
-        reason = info.get("Install Reason", "")
+        raw_reason = info.get("Install Reason", "")
+        reason = (
+            "用户主动安装" if raw_reason.casefold().startswith("explicit")
+            else "作为其他软件的依赖安装" if "dependency" in raw_reason.casefold()
+            else raw_reason
+        )
         aliases = candidate_aliases(name)
         sw = Software(
             id=f"pacman:{name}",
@@ -1758,6 +1763,135 @@ def package_dependencies(sw: Software) -> list[str]:
     return []
 
 
+def canonical_package_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def reverse_dependencies(sw: Software) -> list[str]:
+    manager = sw.metadata.get("manager")
+    name = sw.package_name
+    if not name:
+        return []
+    if sw.required_by:
+        return list(dict.fromkeys(sw.required_by))
+    if manager == "apt":
+        q = run(["apt-cache", "rdepends", "--installed", name], timeout=20)
+        if q.returncode == 0:
+            result: list[str] = []
+            for line in q.stdout.splitlines()[1:]:
+                item = line.strip().lstrip("|").strip()
+                if item and item != name:
+                    result.append(item)
+            return list(dict.fromkeys(result))
+    elif manager in RPM_MANAGERS:
+        q = run(["rpm", "-q", "--whatrequires", name, "--qf", "%{NAME}\\n"], timeout=20)
+        if q.returncode == 0:
+            return list(dict.fromkeys(line.strip() for line in q.stdout.splitlines() if line.strip() and line.strip() != name))
+    elif manager == "apk":
+        q = run(["apk", "info", "-r", name], timeout=20)
+        if q.returncode == 0:
+            return list(dict.fromkeys(line.strip() for line in q.stdout.splitlines() if line.strip() and line.strip() != name))
+    elif manager == "xbps":
+        q = run(["xbps-query", "-X", name], timeout=20)
+        if q.returncode == 0:
+            return list(dict.fromkeys(line.strip() for line in q.stdout.splitlines() if line.strip() and line.strip() != name))
+    elif manager == "emerge":
+        atom = sw.metadata.get("atom", name)
+        q = run(["equery", "depends", atom], timeout=20)
+        if q.returncode == 0:
+            result = []
+            for line in q.stdout.splitlines():
+                match = re.match(r"^\s*([^\s]+/[^\s]+)", line)
+                if match and match.group(1) != atom:
+                    result.append(match.group(1).split("-")[0])
+            return list(dict.fromkeys(result))
+    elif manager == "brew":
+        q = run(["brew", "uses", "--installed", name], timeout=20)
+        if q.returncode == 0:
+            return [line.strip() for line in q.stdout.splitlines() if line.strip()]
+    elif manager in {"pip", "pipx"}:
+        target = canonical_package_name(name)
+        result = []
+        for dist in importlib_metadata.distributions():
+            try:
+                dist_name = dist.metadata.get("Name", "")
+            except Exception:
+                continue
+            for requirement in dist.requires or []:
+                req_name = re.split(r"[<>=!~;\[\s]", requirement, 1)[0]
+                if canonical_package_name(req_name) == target and canonical_package_name(dist_name) != target:
+                    result.append(dist_name)
+                    break
+        return sorted(set(result), key=str.casefold)
+    elif manager in {"npm", "yarn", "pnpm"}:
+        location = next((a.path for a in sw.artifacts if a.role == "安装位置"), "")
+        if location:
+            package_dir = Path(location)
+            modules = package_dir.parent.parent if package_dir.parent.name.startswith("@") else package_dir.parent
+            result = []
+            for candidate in _node_modules_packages(modules, manager, sw.method_title):
+                if name in candidate.dependencies:
+                    result.append(candidate.name)
+            return result
+    return []
+
+
+def software_description(sw: Software) -> str:
+    text = (sw.summary or "").strip()
+    if text and text != sw.name and not text.startswith("/home/"):
+        return text
+    if sw.metadata.get("manager") == "gem":
+        q = run(["gem", "specification", sw.package_name, "summary", "--local"], timeout=20)
+        if q.returncode == 0:
+            value = q.stdout.strip()
+            if value:
+                return value
+    if sw.method == "appimage":
+        return "AppImage 便携应用。包内通常自带运行库，具体用途以内置桌面说明和程序界面为准。"
+    if sw.method == "source":
+        return "从源码或手动安装目录发现的程序；包管理器没有提供简介。"
+    if sw.method == "go":
+        return "通过 go install 安装的二进制程序；本地没有统一的包描述字段。"
+    return "本地包管理器没有提供该软件的详细简介。"
+
+
+def software_kind(sw: Software) -> str:
+    if sw.is_residual:
+        return "残留数据（软件本体未发现）"
+    if sw.status == "unregistered":
+        return "只有程序文件 / 源码目录，未发现启动入口"
+    explicit = sw.metadata.get("explicit")
+    if explicit is False:
+        return "依赖项 / 库或运行时组件"
+    if explicit is True:
+        if sw.method in {"appimage", "source", "go"}:
+            return "用户安装的应用或命令行程序"
+        return "用户主动安装的软件"
+    if reverse_dependencies(sw):
+        return "已安装软件（也被其他软件依赖）"
+    return "已安装软件（安装原因未明确记录）"
+
+
+def install_reason_explanation(sw: Software) -> str:
+    if sw.is_residual:
+        return "没有找到对应的软件本体；这里展示的是仍留在用户目录中的配置、数据或缓存。"
+    if sw.status == "unregistered":
+        return "程序文件或源码目录存在，但没有找到指向它的 .desktop 桌面入口或 ~/.local/bin 命令链接。它可能是构建目录、未完成安装的手动程序，或需要直接运行的可执行文件。"
+    if sw.install_reason:
+        explicit = sw.metadata.get("explicit")
+        if explicit is False:
+            return "这不是用户主动选择的软件，而是安装其他软件时由包管理器自动带入的依赖。"
+        if explicit is True:
+            return "这是用户或管理员主动安装的软件，而不是仅作为其他包的依赖被带入。"
+        return sw.install_reason
+    explicit = sw.metadata.get("explicit")
+    if explicit is False:
+        return "包管理器将其标记为依赖项：它不是用户主动安装的最终软件，而是其他软件运行时需要的库或组件。"
+    if explicit is True:
+        return "由用户或管理员主动安装。"
+    return "包管理器没有提供明确的“主动安装 / 依赖”标记。"
+
+
 def package_files(sw: Software) -> list[str]:
     manager = sw.metadata.get("manager")
     name = sw.package_name
@@ -1943,12 +2077,17 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
         add(f"软件标识：{sw.package_name}")
     if sw.package_group:
         add(f"来源分组：{sw.package_group}")
-    if sw.install_reason:
-        add(f"安装原因：{sw.install_reason}")
-    if sw.summary:
-        add("")
-        for part in wrap_display(sw.summary, 100):
-            add(part)
+
+    add("")
+    add("── 软件介绍 ──", "title")
+    add(f"软件类型：{software_kind(sw)}")
+    add("用途说明：")
+    for part in wrap_display(software_description(sw), 100):
+        add("  " + part)
+    add("安装原因：")
+    for part in wrap_display(install_reason_explanation(sw), 100):
+        reason_style = "warning" if sw.is_residual or sw.status == "unregistered" or sw.metadata.get("explicit") is False else "normal"
+        add("  " + part, reason_style)
     if sw.warnings:
         add("")
         for warning in sw.warnings:
@@ -1968,7 +2107,7 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     files = package_files(sw)
     if files:
         add("")
-        add(f"包管理器登记的文件（共 {len(files)} 个）", "subtitle")
+        add(f"包管理器登记的文件 / 目录（共 {len(files)} 项）", "subtitle")
         # Full list stays available in exported reports; the TUI groups it.
         groups: dict[str, int] = {}
         for path in files:
@@ -1995,14 +2134,22 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     add("")
     add("── 依赖关系 ──", "title")
     resolved_dependencies = list(dict.fromkeys(sw.dependencies + package_dependencies(sw)))
+    reverse = reverse_dependencies(sw)
+    add("它需要哪些软件（正向依赖）：")
     if resolved_dependencies:
-        add("依赖：" + ", ".join(resolved_dependencies))
+        for part in wrap_display("  " + ", ".join(resolved_dependencies), 100):
+            add(part)
     else:
-        add("依赖：无记录 / 由程序自带运行时管理", "dim")
+        add("  无记录，或由 AppImage / 程序自身携带运行时。", "dim")
+    add("哪些已安装软件需要它（反向依赖）：")
+    if reverse:
+        for part in wrap_display("  " + ", ".join(reverse), 100):
+            add(part, "warning")
+        add("  ↑ 卸载这个包可能影响以上软件。", "warning")
+    else:
+        add("  没有发现其他已安装软件依赖它。", "dim")
     if sw.optional_dependencies:
         add("可选依赖：" + ", ".join(sw.optional_dependencies))
-    if sw.required_by:
-        add("被哪些包依赖：" + ", ".join(sw.required_by))
     if sw.metadata.get("installed_size"):
         add("包管理器记录大小：" + str(sw.metadata["installed_size"]))
     if sw.metadata.get("installed_size_bytes"):
@@ -2160,6 +2307,7 @@ class TUI:
         self.list_filter = "all"
         self.search = ""
         self.scan_note = ""
+        self.detail_cache: dict[str, list[tuple[str, str]]] = {}
 
     def init_colors(self) -> None:
         try:
@@ -2314,6 +2462,8 @@ class TUI:
         title_style = "danger" if method.residual else "subtitle"
         filters = {"all": "全部", "explicit": "显式安装", "deps": "依赖包", "foreign": "第三方/本地"}
         self.header(stdscr, f"{method.title} · {filters.get(self.list_filter, '全部')}" + (f" · 搜索 {self.search}" if self.search else ""), f"{len(items)} / {len(method.softwares)} 个")
+        legend = "● 已安装   ○ 无启动入口   ● 红色=残留   ｜ 主动=用户主动安装，依赖=随其他软件带入"
+        self.put(stdscr, 3, 2, legend, max_x - 4, "dim")
         start_y = 4
         page = max(1, max_y - start_y - 3)
         if items:
@@ -2330,14 +2480,14 @@ class TUI:
                     status = "● 残留"
                 elif sw.status == "unregistered":
                     style = "warning"
-                    status = "○ 未登记"
+                    status = "○ 无入口"
                 else:
                     style = "normal"
                     status = "● 已安装"
                 reason = ""
                 explicit = sw.metadata.get("explicit")
                 if explicit is True:
-                    reason = "显式"
+                    reason = "主动"
                 elif explicit is False:
                     reason = "依赖"
                 elif sw.metadata.get("foreign"):
@@ -2347,9 +2497,6 @@ class TUI:
                 right = f"{reason:<4} {version:>22}"
                 line = pad_display(label, max(16, max_x - 32)) + right
                 self.put(stdscr, start_y + row, 1, line, max_x - 2, style, selected=selected)
-            if self.list_filter != "all":
-                filter_note = f"筛选：{filters.get(self.list_filter, self.list_filter)}"
-                self.put(stdscr, start_y - 1, 3, filter_note, max_x - 6, "dim")
         else:
             self.put(stdscr, start_y + 2, 4, "没有匹配项。", max_x - 8, "warning")
         if method.residual:
@@ -2368,7 +2515,9 @@ class TUI:
             self.footer(stdscr, "没有可显示的项目，Esc 返回")
             return
         self.header(stdscr, f"软件详情 · {sw.name}", sw.status_label)
-        raw = detail_lines(sw, self.inventory)
+        if sw.id not in self.detail_cache:
+            self.detail_cache[sw.id] = detail_lines(sw, self.inventory)
+        raw = self.detail_cache[sw.id]
         content: list[tuple[str, str]] = []
         for text, style in raw:
             wrapped = wrap_display(text, max(20, max_x - 5))
@@ -2423,6 +2572,7 @@ class TUI:
         # Remove now-missing artifacts from the in-memory model.
         for container in (sw.artifacts, sw.data_artifacts, sw.cache_artifacts):
             container[:] = [a for a in container if os.path.lexists(a.path)]
+        self.detail_cache.pop(sw.id, None)
         message = f"已删除 {len(deleted)} 个路径。日志：{DELETE_LOG}"
         if errors:
             message += f"  失败 {len(errors)} 个，见日志。"
@@ -2488,6 +2638,7 @@ class TUI:
                         self.search = ""
                 elif ch == ord("r"):
                     self.inventory = self.refresh_cb()
+                    self.detail_cache.clear()
                     self.method_index = 0
                     self.software_index = 0
             elif self.state == "list":
@@ -2523,6 +2674,7 @@ class TUI:
                     self.flash(stdscr, f"已导出：{md_path}", "success")
                 elif ch == ord("r"):
                     self.inventory = self.refresh_cb()
+                    self.detail_cache.clear()
                     self.method_index = min(self.method_index, len(self.inventory.methods) - 1)
                     self.software_index = 0
             else:

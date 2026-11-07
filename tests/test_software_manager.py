@@ -45,6 +45,29 @@ Install Reason  : Installed as a dependency for another package
         self.assertIn("ubuntu", family)
         self.assertIn("debian", family)
 
+    def test_status_and_reason_explanations(self):
+        unregistered = sm.Software(
+            id="manual:x", name="ccls", method="source", method_title="源码 / 手动安装",
+            status="unregistered", summary="source directory",
+        )
+        self.assertEqual(unregistered.status_label, "未发现入口")
+        self.assertIn(".desktop", sm.install_reason_explanation(unregistered))
+
+        dependency = sm.Software(
+            id="pacman:a52dec", name="a52dec", method="pacman", method_title="pacman",
+            package_name="a52dec", metadata={"manager": "pacman", "explicit": False},
+        )
+        self.assertIn("依赖", sm.software_kind(dependency))
+        self.assertIn("依赖项", sm.install_reason_explanation(dependency))
+
+    def test_reverse_dependencies_uses_pacman_required_by(self):
+        sw = sm.Software(
+            id="pacman:libfoo", name="libfoo", method="pacman", method_title="pacman",
+            package_name="libfoo", required_by=["player", "editor"],
+            metadata={"manager": "pacman"},
+        )
+        self.assertEqual(sm.reverse_dependencies(sw), ["player", "editor"])
+
     def test_node_modules_scanner_reads_manifest_without_npm(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "node_modules"
