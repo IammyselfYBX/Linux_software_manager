@@ -37,6 +37,57 @@
 - AppImage
 - Homebrew / Linuxbrew
 
+### 编辑器插件 / 扩展
+
+- Vim / Neovim
+  - vim-plug：`~/.vim/plugged`、`~/.config/nvim/plugged`
+  - lazy.nvim：`~/.local/share/nvim/lazy`
+  - Vim package：`~/.vim/pack/*/{start,opt}`
+  - Neovim package：`~/.local/share/nvim/site/pack/*/{start,opt}`
+  - dein.vim
+  - 系统内置 Vim package，例如 `termdebug`
+- VS Code / VSCodium / Code OSS / Cursor
+  - `~/.vscode/extensions`
+  - `~/.vscode-oss/extensions`
+  - `~/.vscode-server/extensions`
+  - 扩展的 `globalStorage` 用户数据
+
+插件不会作为一个独立桌面程序混入“源码/手动安装”。详情页会显示：
+
+- 宿主应用，例如 Vim、Neovim、VS Code
+- 插件管理器
+- 插件本体位置
+- 插件配置
+- 插件用户数据
+- 子扩展和扩展包关系
+- 插件本体是否缺失
+
+例如 `coc.nvim` 当前会被归类为：
+
+```text
+[插件本体缺失] coc.nvim
+宿主应用：Vim
+插件管理器：vim-plug
+插件本体：未找到 ~/.vim/plugged/coc.nvim
+插件配置：~/.vim/plugin/coc.vim、~/.vim/coc-settings.json
+插件数据：~/.config/coc
+包含的子扩展：coc-json、coc-python、coc-tsserver 等
+```
+
+### 浏览器扩展 / 插件
+
+- Google Chrome
+- Chromium
+- Brave
+- Microsoft Edge
+- Vivaldi
+- Firefox
+- Adobe Flash Player / NPAPI / PPAPI 历史浏览器插件
+
+浏览器扩展会显示宿主浏览器、Profile、扩展 ID、扩展本体和 `Local Extension Settings` / `browser-extension-data` 数据。只有数据目录、没有扩展本体的条目会被标成“插件本体缺失”。
+
+Flash 会归入“浏览器插件”，不会再作为普通源码目录列出。详情页会标注宿主浏览器、NPAPI/PPAPI 类型以及 Flash 已停止支持的状态。
+
 ### 语言级包管理器
 
 - Python：`pip --user`、`pipx`
@@ -72,6 +123,9 @@
 - `● 已安装`：包管理器或对应安装工具有完整的安装记录。
 - `○ 无启动入口`：发现了程序文件或源码目录，但没有找到 `.desktop` 桌面入口或 `~/.local/bin` 命令链接。它可能是构建目录、未完成安装，或需要直接运行的程序文件。
 - 红色 `● 残留`：没有找到对应的软件本体，只剩用户数据或缓存。
+- 黄色 `○ 插件缺失`：编辑器/浏览器插件的数据或配置存在，但插件本体目录缺失。
+- 黄色 `○ 仅声明`：编辑器配置中声明了插件，但没有找到插件本体。
+- 红色 `● 宿主缺失`：插件还在，但对应的编辑器或浏览器没有检测到。
 - `主动`：用户或管理员主动安装的软件。
 - `依赖`：安装其他软件时由包管理器自动带入的库、运行时或组件。
 
@@ -81,6 +135,7 @@
 - 安装原因的具体解释
 - 它依赖哪些软件
 - 哪些已安装软件反过来依赖它
+- 插件与宿主应用的关系
 - 卸载可能影响哪些软件
 
 ## 快捷键
@@ -90,7 +145,7 @@
 | 安装方式 | ↑/↓、1-9、Enter | 选择并进入 |
 | 软件列表 | ↑/↓、PgUp/PgDn、Home/End | 移动 |
 | 软件列表 | `/` | 搜索 |
-| 软件列表 | `f` | 全部 / 显式安装 / 依赖包 / 第三方 |
+| 软件列表 | `f` | 通用包：全部 / 显式安装 / 依赖包 / 第三方；插件页：全部 / 已安装 / 缺失或未安装 / 宿主已卸载 |
 | 软件列表 | `e` | 导出整份清单 |
 | 详情 | ↑/↓、PgUp/PgDn、Home/End | 滚动 |
 | 详情 | `e` | 导出当前软件完整详情 |

@@ -35,12 +35,13 @@ import sys
 import textwrap
 import time
 import unicodedata
+import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 APP_NAME = "Software Manager"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 STATE_DIR = Path.home() / ".local" / "state" / "software_manager"
 DELETE_LOG = STATE_DIR / "delete.log"
 
@@ -75,6 +76,40 @@ GENERIC_PREFIXES = (
 STOP_ALIASES = {
     "appimage", "bin", "local", "usr", "linux", "x86", "x8664", "x64",
     "tool", "tools", "package", "application", "desktop", "source", "manual",
+}
+
+KNOWN_PLUGIN_DESCRIPTIONS = {
+    "coc.nvim": "Vim/Neovim 的语言服务、代码补全、诊断和扩展框架。",
+    "vim-plug": "Vim 插件管理器，负责安装、更新和清理 Plug 声明的插件。",
+    "termdebug": "Vim 内置的 GDB 调试界面插件。",
+    "editorconfig": "EditorConfig 的 Vim 支持插件，用于统一缩进和编码规则。",
+    "nerdtree": "Vim 文件树浏览与文件管理插件。",
+    "vim-airline": "Vim 状态栏和标签栏增强插件。",
+    "fzf": "Vim/Neovim 模糊查找插件。",
+    "fzf.vim": "基于 fzf 的 Vim 模糊搜索集成插件。",
+    "ale": "Vim/Neovim 异步语法检查和修复插件。",
+    "tagbar": "Vim 代码结构/标签浏览侧栏。",
+    "undotree": "Vim 撤销历史可视化插件。",
+    "vim-rainbow": "Vim 括号层级彩色高亮插件。",
+    "asyncrun.vim": "Vim 异步运行命令和构建任务插件。",
+    "vim-live-server": "Vim 中启动实时预览 Web 服务器的插件。",
+    "iciba-translate": "Vim 划词/选中文本翻译插件。",
+    "vim-snippets": "Vim 通用代码片段集合。",
+    "ultisnips": "Vim 代码片段引擎。",
+    "coc-snippets": "coc.nvim 的代码片段扩展。",
+    "coc-ccls": "coc.nvim 的 C/C++/CUDA 语言服务扩展。",
+    "coc-python": "coc.nvim 的 Python 语言支持扩展。",
+    "coc-tsserver": "coc.nvim 的 JavaScript/TypeScript 语言服务扩展。",
+    "coc-json": "coc.nvim 的 JSON 语言支持扩展。",
+    "coc-texlab": "coc.nvim 的 LaTeX 语言服务扩展。",
+    "coc-vimlsp": "coc.nvim 的 Vimscript 语言支持扩展。",
+    "coc-marketplace": "在 coc.nvim 中浏览和安装扩展的客户端。",
+    "vscodevim.vim": "VS Code 的 Vim 键位模拟扩展。",
+    "ms-python.python": "VS Code 的 Python 语言支持扩展。",
+    "github.copilot": "VS Code 的 GitHub Copilot AI 编程助手。",
+    "james-yu.latex-workshop": "VS Code 的 LaTeX 编辑、编译和预览扩展。",
+    "golang.go": "VS Code 的 Go 语言支持扩展。",
+    "ms-vscode.cpptools": "VS Code 的 C/C++ IntelliSense、调试和代码浏览扩展。",
 }
 
 KNOWN_ALIASES = {
@@ -138,7 +173,14 @@ class Software:
             "installed": "已安装",
             "unregistered": "未发现入口",
             "residual": "疑似残留",
+            "plugin_body_missing": "插件本体缺失",
+            "plugin_not_installed": "仅配置声明",
+            "plugin_host_missing": "宿主已卸载",
         }.get(self.status, self.status)
+
+    @property
+    def is_plugin(self) -> bool:
+        return self.method in {"vim-plugin", "vscode-extension", "browser-extension", "browser-plugin"}
 
     @property
     def total_known_size(self) -> int:
@@ -693,6 +735,636 @@ def collect_brew(home: Path) -> list[Software]:
             sw.artifacts.append(Artifact("Homebrew prefix", f"{prefix}/Cellar/{name}", note="Cellar"))
         result.append(sw)
     return result
+
+def _read_small_text(path: Path, limit: int = 4000) -> str:
+    try:
+        return path.read_text(errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+def _plugin_description(name: str, body: Optional[Path], fallback: str) -> str:
+    key = norm(name)
+    for known, description in KNOWN_PLUGIN_DESCRIPTIONS.items():
+        known_key = norm(known)
+        if key == known_key or key.endswith(known_key) or known_key.endswith(key):
+            return description
+    if body and body.is_dir():
+        for readme_name in ("README.md", "README.rst", "README.txt", "readme.md"):
+            readme = body / readme_name
+            if not readme.is_file():
+                continue
+            text = _read_small_text(readme, 8000)
+            lines = []
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line or line.startswith(("#", "[!", "![", "<", "=", "-", "|")):
+                    continue
+                if line.lower().startswith(("badge", "build status", "license")):
+                    continue
+                lines.append(re.sub(r"[`*_]", "", line))
+                if len(" ".join(lines)) >= 180:
+                    break
+            if lines:
+                return " ".join(lines)[:300]
+    return fallback
+
+
+def _host_executable(home: Path, names: Iterable[str], extra_paths: Iterable[Path] = ()) -> bool:
+    if any(which(name) for name in names):
+        return True
+    if any(path.is_file() and os.access(path, os.X_OK) for path in extra_paths):
+        return True
+    return False
+
+
+def _vim_config_files(home: Path) -> list[Path]:
+    candidates = [
+        home / ".vimrc", home / ".vim/.vimrc", home / ".vim/vimrc",
+        home / ".config/nvim/init.vim", home / ".config/nvim/init.lua",
+    ]
+    for root in (home / ".vim", home / ".config/nvim"):
+        if root.is_dir():
+            for pattern in ("plugin/*.vim", "vimconfigs/*.vim", "lua/**/*.lua", "lua/**/*.vim"):
+                candidates.extend(root.glob(pattern))
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            real = str(path.resolve())
+        except OSError:
+            continue
+        if real not in seen and path.is_file():
+            seen.add(real)
+            result.append(path)
+    return sorted(result)
+
+
+def _vim_plugin_bodies(home: Path) -> list[dict[str, str]]:
+    roots: list[tuple[Path, str, int]] = [
+        (home / ".vim/plugged", "vim-plug", 1),
+        (home / ".config/nvim/plugged", "vim-plug", 1),
+        (home / ".local/share/nvim/lazy", "lazy.nvim", 1),
+        (home / ".cache/dein/repos/github.com", "dein.vim", 2),
+        (home / ".local/share/dein/repos/github.com", "dein.vim", 2),
+    ]
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(path: Path, manager: str) -> None:
+        try:
+            real = str(path.resolve())
+        except OSError:
+            return
+        if real in seen or not path.is_dir():
+            return
+        seen.add(real)
+        result.append({"path": real, "manager": manager})
+
+    for root, manager, depth in roots:
+        if not root.is_dir():
+            continue
+        for path in root.glob("*/" * max(0, depth - 1) + "*"):
+            if path.is_dir():
+                add(path, manager)
+    for base in (home / ".vim/pack", home / ".local/share/nvim/site/pack"):
+        if not base.is_dir():
+            continue
+        for package_root in base.glob("*/*/*"):
+            if package_root.is_dir() and package_root.parent.name in {"start", "opt"}:
+                add(package_root, f"Vim package ({package_root.parent.name})")
+    system_pack_bases: list[Path] = []
+    system_pack_bases.extend(Path(p) for p in glob.glob("/usr/share/vim/vim*/pack"))
+    system_pack_bases.extend([Path("/usr/share/nvim/runtime/pack"), Path("/usr/local/share/nvim/runtime/pack")])
+    for base in system_pack_bases:
+        if not base.is_dir():
+            continue
+        for package_root in base.glob("*/*/*"):
+            if package_root.is_dir() and package_root.parent.name in {"start", "opt"}:
+                add(package_root, f"系统内置 Vim package ({package_root.parent.name})")
+    return result
+
+
+def _parse_vim_declarations(files: list[Path]) -> dict[str, dict[str, Any]]:
+    declarations: dict[str, dict[str, Any]] = {}
+    repo_pattern = re.compile(r"['\"]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)['\"]")
+    packadd_pattern = re.compile(r"\bpackadd\s+([A-Za-z0-9_.-]+)")
+    for path in files:
+        text = _read_small_text(path, 200_000)
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith(('"', "#")):
+                continue
+            repo = ""
+            manager = ""
+            if re.search(r"\bPlug\b", stripped):
+                match = repo_pattern.search(stripped)
+                if match:
+                    repo, manager = match.group(1), "vim-plug"
+            elif re.search(r"\buse\b", stripped):
+                match = repo_pattern.search(stripped)
+                if match:
+                    repo, manager = match.group(1), "lazy.nvim/packer/dein"
+            if not repo:
+                match = packadd_pattern.search(stripped)
+                if match:
+                    repo, manager = match.group(1), "Vim package (packadd)"
+            if not repo:
+                continue
+            base = repo.rstrip("/").split("/")[-1]
+            item = declarations.setdefault(repo, {
+                "repo": repo, "name": base, "manager": manager,
+                "configs": set(),
+            })
+            item["configs"].add(str(path))
+            if manager and not item.get("manager"):
+                item["manager"] = manager
+    return declarations
+
+
+def _body_matches_plugin(body: dict[str, str], repo: str, name: str) -> bool:
+    body_name = norm(Path(body["path"]).name)
+    candidates = {norm(name), norm(repo.split("/")[-1]), norm(repo.replace("/", "-"))}
+    return body_name in candidates or any(
+        len(candidate) >= 4 and (body_name.endswith(candidate) or candidate.endswith(body_name))
+        for candidate in candidates
+    )
+
+
+def _coc_extensions(home: Path) -> list[str]:
+    manifest = home / ".config/coc/extensions/package.json"
+    try:
+        data = json.loads(manifest.read_text(errors="replace"))
+        deps = data.get("dependencies", {})
+        return sorted(str(k) for k in deps) if isinstance(deps, dict) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def collect_vim_plugins(home: Path) -> list[Software]:
+    configs = _vim_config_files(home)
+    declarations = _parse_vim_declarations(configs)
+    bodies = _vim_plugin_bodies(home)
+    vim_installed = _host_executable(home, ["vim"], [home / ".vim/main"])
+    nvim_installed = _host_executable(home, ["nvim"], [home / ".local/bin/nvim"])
+    hosts = [name for name, ok in (("Vim", vim_installed or (home / ".vim").is_dir()), ("Neovim", nvim_installed or (home / ".config/nvim").is_dir())) if ok]
+    host_installed = bool(hosts)
+
+    consumed_bodies: set[str] = set()
+    result: list[Software] = []
+    seen_names: set[str] = set()
+
+    def build(repo: str, name: str, body: Optional[dict[str, str]], declared: Optional[dict[str, Any]]) -> None:
+        manager = (declared or {}).get("manager") or (body or {}).get("manager", "")
+        config_paths = sorted((declared or {}).get("configs", set()))
+        data_paths: list[Path] = []
+        metadata: dict[str, Any] = {
+            "plugin_type": "Vim / Neovim 插件",
+            "host_apps": hosts,
+            "host_installed": host_installed,
+            "plugin_manager": manager,
+            "repo": repo,
+            "body_installed": body is not None,
+            "config_installed": bool(config_paths),
+        }
+        if norm(name) == norm("coc.nvim"):
+            data_paths.append(home / ".config/coc")
+            for cfg in (home / ".vim/coc-settings.json", home / ".vim/coc-settings.json.back", home / ".config/nvim/coc-settings.json"):
+                if cfg.is_file() and str(cfg) not in config_paths:
+                    config_paths.append(str(cfg))
+            sub_extensions = _coc_extensions(home)
+            if sub_extensions:
+                metadata["sub_extensions"] = sub_extensions
+        for config_path in config_paths:
+            text = _read_small_text(Path(config_path), 200_000).casefold()
+            if norm(name) in norm(text):
+                continue
+        data_existing = [p for p in data_paths if p.exists()]
+        if not host_installed:
+            status = "plugin_host_missing"
+        elif body:
+            status = "installed"
+        elif data_existing:
+            status = "plugin_body_missing"
+        else:
+            status = "plugin_not_installed"
+        summary = _plugin_description(name, Path(body["path"]) if body else None, "Vim/Neovim 插件。")
+        sw = Software(
+            id=f"vim-plugin:{repo or name}", name=name, method="vim-plugin",
+            method_title="Vim / Neovim 插件", status=status, summary=summary,
+            package_name=name, package_group="Vim/Neovim",
+            aliases=sorted(candidate_aliases(name, repo)), metadata=metadata,
+        )
+        if body:
+            sw.artifacts.append(Artifact("插件本体", body["path"]))
+        elif manager == "vim-plug":
+            sw.artifacts.append(Artifact("预期插件位置", str(home / ".vim/plugged" / name), exists=False, note="未找到"))
+        for config_path in config_paths:
+            sw.artifacts.append(Artifact("插件配置", str(config_path)))
+        for data_path in data_paths:
+            if data_path.exists():
+                sw.data_artifacts.append(Artifact("插件数据", str(data_path), size=path_size(str(data_path))))
+        if status == "plugin_body_missing":
+            sw.warnings.append("插件配置或数据仍然存在，但没有找到插件本体目录。不要直接按普通软件残留删除。")
+        elif status == "plugin_host_missing":
+            sw.warnings.append("宿主编辑器未检测到，这个插件目录可能是编辑器卸载后的残留。")
+        result.append(sw)
+        seen_names.add(norm(name))
+
+    coc_subextensions = {norm(item) for item in _coc_extensions(home)}
+    for repo, declared in declarations.items():
+        name = declared["name"]
+        if name.startswith("coc-") and norm(name) in coc_subextensions:
+            # coc extensions are represented as children of coc.nvim, not as
+            # independent Vim plugins.
+            continue
+        body = next((item for item in bodies if _body_matches_plugin(item, repo, name)), None)
+        if name == "vim-plug":
+            plug_file = home / ".vim/autoload/plug.vim"
+            if plug_file.is_file():
+                body = {"path": str(plug_file), "manager": "vim-plug"}
+        if body:
+            consumed_bodies.add(body["path"])
+        build(repo, name, body, declared)
+
+    for body in bodies:
+        if body["path"] in consumed_bodies:
+            continue
+        name = Path(body["path"]).name
+        build(name, name, body, None)
+    return result
+
+
+def _code_host_specs(home: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "Visual Studio Code", "extensions": home / ".vscode/extensions",
+            "config": home / ".config/Code", "commands": ["code"],
+            "extra": [home / ".local/bin/code", home / ".application/VSCode-linux-x64/code"],
+        },
+        {
+            "name": "VSCodium / Code OSS", "extensions": home / ".vscode-oss/extensions",
+            "config": home / ".config/VSCodium", "commands": ["codium", "code-oss"],
+            "extra": [home / ".local/bin/codium"],
+        },
+        {
+            "name": "VS Code Server", "extensions": home / ".vscode-server/extensions",
+            "config": home / ".vscode-server", "commands": ["code-server"],
+            "extra": [],
+        },
+        {
+            "name": "Cursor", "extensions": home / ".cursor/extensions",
+            "config": home / ".config/Cursor", "commands": ["cursor"],
+            "extra": [],
+        },
+    ]
+
+
+def collect_vscode_extensions(home: Path) -> list[Software]:
+    result: list[Software] = []
+    for spec in _code_host_specs(home):
+        ext_root: Path = spec["extensions"]
+        if not ext_root.is_dir():
+            continue
+        host_installed = _host_executable(home, spec["commands"], spec["extra"]) or (spec["config"] / "User").is_dir()
+        installed_ids: set[str] = set()
+        for ext_dir in [p for p in ext_root.iterdir() if p.is_dir()]:
+            manifest = ext_dir / "package.json"
+            if not manifest.is_file():
+                continue
+            try:
+                data = json.loads(manifest.read_text(errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            publisher = str(data.get("publisher", ""))
+            package_name = str(data.get("name", ext_dir.name))
+            ext_id = f"{publisher}.{package_name}" if publisher and "." not in package_name else package_name
+            installed_ids.add(ext_id)
+            display_name = str(data.get("displayName", "")).strip()
+            if not display_name or display_name.startswith("%"):
+                display_name = str(data.get("name", ext_dir.name))
+            description = str(data.get("description", "")).strip()
+            if not description or description.startswith("%"):
+                description = KNOWN_PLUGIN_DESCRIPTIONS.get(ext_id.casefold(), "")
+            if not description:
+                description = "VS Code 扩展。"
+            dependencies = [str(x) for x in data.get("extensionDependencies", []) if x]
+            extensions_pack = [str(x) for x in data.get("extensionPack", []) if x]
+            status = "installed" if host_installed else "plugin_host_missing"
+            sw = Software(
+                id=f"vscode-extension:{ext_id}", name=display_name,
+                method="vscode-extension", method_title="VS Code 扩展",
+                version=str(data.get("version", "")), status=status,
+                summary=description, package_name=ext_id,
+                package_group=str(spec["name"]), dependencies=dependencies,
+                aliases=sorted(candidate_aliases(display_name, ext_id, package_name)),
+                metadata={
+                    "plugin_type": "VS Code 扩展",
+                    "host_app": spec["name"], "host_installed": host_installed,
+                    "extension_id": ext_id, "publisher": publisher,
+                    "body_installed": True, "extension_pack": extensions_pack,
+                },
+            )
+            sw.artifacts.append(Artifact("扩展本体", str(ext_dir)))
+            data_path = spec["config"] / "User" / "globalStorage" / ext_id
+            if data_path.exists():
+                sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+            result.append(sw)
+
+        global_root = spec["config"] / "User" / "globalStorage"
+        if global_root.is_dir():
+            for data_path in global_root.iterdir():
+                if not data_path.is_dir() or data_path.name in installed_ids:
+                    continue
+                status = "plugin_body_missing" if host_installed else "plugin_host_missing"
+                sw = Software(
+                    id=f"vscode-extension-data:{spec['name']}:{data_path.name}",
+                    name=f"扩展 {data_path.name}", method="vscode-extension",
+                    method_title="VS Code 扩展", status=status,
+                    summary="VS Code 扩展用户数据；未找到对应扩展本体",
+                    package_name=data_path.name, package_group=str(spec["name"]),
+                    aliases=sorted(candidate_aliases(data_path.name)),
+                    metadata={
+                        "plugin_type": "VS Code 扩展", "host_app": spec["name"],
+                        "host_installed": host_installed, "extension_id": data_path.name,
+                        "body_installed": False,
+                    },
+                )
+                sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+                sw.warnings.append("只找到 VS Code 扩展数据，没有找到对应的扩展安装目录。")
+                result.append(sw)
+    return result
+
+
+def _resolve_manifest_message(messages: dict[str, Any], value: str) -> str:
+    match = re.match(r"^__MSG_(.+)__$", value or "", flags=re.IGNORECASE)
+    if match:
+        key = match.group(1)
+        for candidate in (key, key.lower(), key.casefold()):
+            item = messages.get(candidate)
+            if isinstance(item, dict) and item.get("message"):
+                return str(item["message"])
+    return value
+
+
+def _chrome_manifest_metadata(manifest_path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(manifest_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    messages: dict[str, Any] = {}
+    locale_name = data.get("default_locale") or "en"
+    messages_path = manifest_path.parent / "_locales" / locale_name / "messages.json"
+    try:
+        messages = json.loads(messages_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    name = _resolve_manifest_message(messages, str(data.get("name", "")))
+    description = _resolve_manifest_message(messages, str(data.get("description", "")))
+    return {
+        "name": name or manifest_path.parent.parent.name,
+        "description": description,
+        "version": str(data.get("version", "")),
+        "manifest_version": str(data.get("manifest_version", "")),
+    }
+
+
+def _browser_host_specs(home: Path) -> list[dict[str, Any]]:
+    return [
+        {"name": "Google Chrome", "root": home / ".config/google-chrome", "commands": ["google-chrome", "google-chrome-stable"]},
+        {"name": "Chromium", "root": home / ".config/chromium", "commands": ["chromium", "chromium-browser"]},
+        {"name": "Brave", "root": home / ".config/BraveSoftware/Brave-Browser", "commands": ["brave-browser", "brave"]},
+        {"name": "Microsoft Edge", "root": home / ".config/microsoft-edge", "commands": ["microsoft-edge", "microsoft-edge-stable"]},
+        {"name": "Vivaldi", "root": home / ".config/vivaldi", "commands": ["vivaldi", "vivaldi-stable"]},
+    ]
+
+
+def _host_available(commands: list[str]) -> bool:
+    return any(which(name) for name in commands)
+
+
+def collect_browser_extensions(home: Path) -> list[Software]:
+    result: list[Software] = []
+    for spec in _browser_host_specs(home):
+        root: Path = spec["root"]
+        if not root.is_dir():
+            continue
+        host_installed = _host_available(spec["commands"])
+        installed_by_profile: dict[str, set[str]] = {}
+        for profile in [p for p in root.iterdir() if p.is_dir() and (p / "Extensions").is_dir()]:
+            installed_ids: set[str] = set()
+            for manifest_path in profile.glob("Extensions/*/*/manifest.json"):
+                parts = manifest_path.parts
+                try:
+                    ext_index = parts.index("Extensions")
+                    ext_id = parts[ext_index + 1]
+                except (ValueError, IndexError):
+                    continue
+                meta = _chrome_manifest_metadata(manifest_path)
+                if not meta:
+                    continue
+                installed_ids.add(ext_id)
+                data_path = profile / "Local Extension Settings" / ext_id
+                status = "installed" if host_installed else "plugin_host_missing"
+                sw = Software(
+                    id=f"browser-extension:{spec['name']}:{profile.name}:{ext_id}",
+                    name=meta["name"], method="browser-extension",
+                    method_title="浏览器扩展", version=meta["version"],
+                    status=status, summary=meta["description"] or "浏览器扩展",
+                    package_name=ext_id, package_group=str(spec["name"]),
+                    aliases=sorted(candidate_aliases(meta["name"], ext_id)),
+                    metadata={
+                        "plugin_type": "浏览器扩展", "host_app": spec["name"],
+                        "host_installed": host_installed, "extension_id": ext_id,
+                        "profile": profile.name, "manifest_version": meta["manifest_version"],
+                        "body_path": str(manifest_path.parent),
+                    },
+                )
+                sw.artifacts.append(Artifact("扩展本体", str(manifest_path.parent)))
+                if data_path.exists():
+                    sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+                result.append(sw)
+            installed_by_profile[profile.name] = installed_ids
+
+        # Local Extension Settings can outlive the extension body.
+        for profile in [p for p in root.iterdir() if p.is_dir()]:
+            settings_root = profile / "Local Extension Settings"
+            if not settings_root.is_dir():
+                continue
+            installed = installed_by_profile.get(profile.name, set())
+            for data_path in settings_root.iterdir():
+                if not data_path.is_dir() or data_path.name in installed:
+                    continue
+                status = "plugin_body_missing" if host_installed else "plugin_host_missing"
+                sw = Software(
+                    id=f"browser-extension-data:{spec['name']}:{profile.name}:{data_path.name}",
+                    name=f"扩展 {data_path.name}", method="browser-extension",
+                    method_title="浏览器扩展", status=status,
+                    summary="浏览器扩展数据；未找到对应扩展本体",
+                    package_name=data_path.name, package_group=str(spec["name"]),
+                    aliases=sorted(candidate_aliases(data_path.name)),
+                    metadata={
+                        "plugin_type": "浏览器扩展", "host_app": spec["name"],
+                        "host_installed": host_installed, "extension_id": data_path.name,
+                        "profile": profile.name, "body_installed": False,
+                    },
+                )
+                sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+                sw.warnings.append("只找到扩展数据目录，没有找到对应的 manifest.json / 扩展本体。")
+                result.append(sw)
+
+    # Firefox extensions and their browser-extension-data.
+    firefox_root = home / ".mozilla/firefox"
+    firefox_installed = _host_executable(home, ["firefox"])
+    if firefox_root.is_dir():
+        for profile in [p for p in firefox_root.iterdir() if p.is_dir()]:
+            ext_root = profile / "extensions"
+            installed_ids: set[str] = set()
+            if ext_root.is_dir():
+                for entry in ext_root.iterdir():
+                    if not (entry.is_file() or entry.is_dir()):
+                        continue
+                    ext_id = entry.stem if entry.suffix.lower() == ".xpi" else entry.name
+                    meta: dict[str, str] = {}
+                    try:
+                        if entry.suffix.lower() == ".xpi" and zipfile.is_zipfile(entry):
+                            with zipfile.ZipFile(entry) as archive:
+                                if "manifest.json" in archive.namelist():
+                                    meta = json.loads(archive.read("manifest.json").decode(errors="replace"))
+                    except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+                        pass
+                    ext_id = str((meta.get("browser_specific_settings") or {}).get("gecko", {}).get("id", ext_id))
+                    installed_ids.add(ext_id)
+                    name = str(meta.get("name", "")).strip() or ext_id
+                    description = str(meta.get("description", "")).strip()
+                    status = "installed" if firefox_installed else "plugin_host_missing"
+                    sw = Software(
+                        id=f"browser-extension:Firefox:{profile.name}:{ext_id}",
+                        name=name, method="browser-extension", method_title="浏览器扩展",
+                        version=str(meta.get("version", "")), status=status,
+                        summary=description or "Firefox 扩展", package_name=ext_id,
+                        package_group="Firefox", aliases=sorted(candidate_aliases(name, ext_id)),
+                        metadata={
+                            "plugin_type": "浏览器扩展", "host_app": "Firefox",
+                            "host_installed": firefox_installed, "extension_id": ext_id,
+                            "profile": profile.name, "body_path": str(entry),
+                        },
+                    )
+                    sw.artifacts.append(Artifact("扩展本体", str(entry)))
+                    data_path = profile / "browser-extension-data" / ext_id
+                    if data_path.exists():
+                        sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+                    result.append(sw)
+            data_root = profile / "browser-extension-data"
+            if data_root.is_dir():
+                for data_path in data_root.iterdir():
+                    if not data_path.is_dir() or data_path.name in installed_ids:
+                        continue
+                    if data_path.name.endswith("@search.mozilla.org"):
+                        continue
+                    status = "plugin_body_missing" if firefox_installed else "plugin_host_missing"
+                    sw = Software(
+                        id=f"browser-extension-data:Firefox:{profile.name}:{data_path.name}",
+                        name=f"Firefox 扩展 {data_path.name}", method="browser-extension",
+                        method_title="浏览器扩展", status=status,
+                        summary="Firefox 扩展数据；未找到对应扩展本体",
+                        package_name=data_path.name, package_group="Firefox",
+                        aliases=sorted(candidate_aliases(data_path.name)),
+                        metadata={
+                            "plugin_type": "浏览器扩展", "host_app": "Firefox",
+                            "host_installed": firefox_installed, "extension_id": data_path.name,
+                            "profile": profile.name, "body_installed": False,
+                        },
+                    )
+                    sw.data_artifacts.append(Artifact("扩展数据", str(data_path), size=path_size(str(data_path))))
+                    sw.warnings.append("只找到扩展数据目录，没有找到对应 XPI / 扩展本体。")
+                    result.append(sw)
+    return result
+
+
+def collect_flash_plugins(home: Path) -> list[Software]:
+    candidates: list[Path] = [
+        home / ".application/flashplayer",
+        home / ".mozilla/plugins/libflashplayer.so",
+        Path("/usr/lib/mozilla/plugins/libflashplayer.so"),
+        Path("/usr/lib/browser-plugins/libflashplayer.so"),
+        Path("/usr/lib64/mozilla/plugins/libflashplayer.so"),
+    ]
+    patterns = [
+        str(home / ".application/*/libflashplayer.so"),
+        str(home / ".application/*/usr/lib*/mozilla/plugins/libflashplayer.so"),
+        str(home / ".config/chromium/*/Pepper Data/Shockwave Flash/*/manifest.json"),
+        str(home / ".config/google-chrome/*/Pepper Data/Shockwave Flash/*/manifest.json"),
+    ]
+    for pattern in patterns:
+        candidates.extend(Path(p) for p in glob.glob(pattern))
+    paths = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            real = str(path.resolve()) if path.exists() else str(path)
+        except OSError:
+            real = str(path)
+        if path.exists() and real not in seen:
+            seen.add(real)
+            paths.append(path)
+    if not paths:
+        return []
+    hosts = []
+    for name, command in (("Firefox", "firefox"), ("Chromium", "chromium"), ("Google Chrome", "google-chrome")):
+        if which(command):
+            hosts.append(name)
+    host_installed = bool(hosts)
+    status = "installed" if host_installed else "plugin_host_missing"
+    sw = Software(
+        id="browser-plugin:adobe-flash", name="Adobe Flash Player",
+        method="browser-plugin", method_title="浏览器插件 · Flash/NPAPI",
+        status=status,
+        summary="Adobe Flash Player NPAPI/PPAPI 浏览器插件，用于播放旧式 Flash 内容。Adobe 已于 2020 年停止支持。",
+        package_name="flashplayer", package_group="浏览器插件 · NPAPI/PPAPI",
+        aliases=sorted(candidate_aliases("flash", "flashplayer", "adobe flash player")),
+        metadata={
+            "plugin_type": "浏览器插件（NPAPI/PPAPI）",
+            "host_apps": hosts,
+            "host_installed": host_installed,
+            "deprecated": True,
+            "active_status": "历史兼容插件；现代浏览器已停止支持 Flash",
+        },
+    )
+    added_dirs: set[str] = set()
+    for path in paths:
+        role = "浏览器插件本体" if path.suffix == ".so" or path.name == "flashplayer" else "Flash 配置/清单"
+        if "Pepper Data" in str(path):
+            role = "PPAPI Flash 清单"
+        sw.artifacts.append(Artifact(role, str(path), size=path_size(str(path))))
+        if path.name == "libflashplayer.so" and path.parent.name.startswith("flash_player"):
+            install_dir = path.parent
+            if str(install_dir) not in added_dirs:
+                sw.artifacts.append(Artifact("解压安装目录", str(install_dir)))
+                added_dirs.add(str(install_dir))
+    sw.warnings.append("Flash 已停止支持。该文件可能仅供 Firefox/Chromium 的旧插件配置使用，不建议按普通源码目录删除。")
+    return [sw]
+
+
+def remove_source_plugin_overlaps(methods: list[Method]) -> None:
+    plugin_paths: list[str] = []
+    for method in methods:
+        if method.id not in {"editor-plugins", "browser-plugins"}:
+            continue
+        for sw in method.softwares:
+            for artifact in sw.artifacts + sw.data_artifacts:
+                plugin_paths.append(os.path.realpath(artifact.path))
+    for method in methods:
+        if method.id != "source":
+            continue
+        kept: list[Software] = []
+        for sw in method.softwares:
+            root = os.path.realpath(str(sw.metadata.get("install_root", "")))
+            if root and any(p == root or p.startswith(root + os.sep) or root.startswith(p + os.sep) for p in plugin_paths):
+                continue
+            kept.append(sw)
+        method.softwares = kept
+
 
 def _software_location(manager: str, package: str, version: str, *, title: str,
                        summary: str = "", deps: Optional[list[str]] = None,
@@ -1453,8 +2125,17 @@ def attach_userdata(inventory: Inventory, home: Path) -> None:
             s.name.casefold(),
         ),
     )
-    claimed: set[str] = set()
+    claimed: set[str] = {
+        artifact.path
+        for software in softwares
+        for artifact in (*software.artifacts, *software.data_artifacts, *software.cache_artifacts)
+    }
     for sw in softwares:
+        if sw.is_plugin:
+            # Plugin scanners already associate exact data directories.
+            # Broad alias matching would let generic words such as "project"
+            # claim unrelated QtProject data.
+            continue
         aliases = set(sw.aliases) | candidate_aliases(sw.name)
         for role, path in roots:
             if str(path) in claimed:
@@ -1651,6 +2332,29 @@ def scan_inventory(progress=None) -> Inventory:
     appimages = collect_appimages(home, desktop, local_bins)
     if appimages:
         methods.append(Method("appimage", "AppImage", "便携程序、启动入口与回收站文件", appimages))
+
+    if progress:
+        progress("扫描编辑器插件与扩展")
+    vim_plugins = collect_vim_plugins(home)
+    vscode_extensions = collect_vscode_extensions(home)
+    editor_plugins = vim_plugins + vscode_extensions
+    if editor_plugins:
+        methods.append(Method(
+            "editor-plugins", "编辑器插件 · Vim / Neovim / VS Code",
+            "插件本体、配置、用户数据、子扩展和宿主应用关系",
+            editor_plugins,
+        ))
+
+    if progress:
+        progress("扫描浏览器扩展与 Flash/NPAPI 插件")
+    browser_plugins = collect_browser_extensions(home) + collect_flash_plugins(home)
+    if browser_plugins:
+        methods.append(Method(
+            "browser-plugins", "浏览器扩展 / 插件",
+            "Chrome/Chromium/Firefox 扩展及 Flash/NPAPI 历史插件",
+            browser_plugins,
+        ))
+
     if progress:
         progress("扫描源码 / 手动安装")
     manual = collect_source_manual(home, desktop, local_bins)
@@ -1686,6 +2390,8 @@ def scan_inventory(progress=None) -> Inventory:
     other_lang = composer + luarocks
     if other_lang:
         methods.append(Method("other-lang", "其他语言包管理器", "PHP Composer、Lua LuaRocks", other_lang))
+
+    remove_source_plugin_overlaps(methods)
 
     inventory = Inventory(
         generated_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1836,6 +2542,23 @@ def reverse_dependencies(sw: Software) -> list[str]:
     return []
 
 
+def plugin_reverse_dependencies(sw: Software, inventory: Inventory) -> list[str]:
+    if not sw.is_plugin or not sw.package_name:
+        return []
+    target = canonical_package_name(sw.package_name)
+    target_name = canonical_package_name(sw.name)
+    result: list[str] = []
+    for other in inventory.all_software():
+        if other.id == sw.id or not other.is_plugin:
+            continue
+        for dependency in other.dependencies:
+            dep = canonical_package_name(dependency)
+            if dep == target or dep == target_name:
+                result.append(other.name)
+                break
+    return sorted(set(result), key=str.casefold)
+
+
 def software_description(sw: Software) -> str:
     text = (sw.summary or "").strip()
     if text and text != sw.name and not text.startswith("/home/"):
@@ -1858,6 +2581,17 @@ def software_description(sw: Software) -> str:
 def software_kind(sw: Software) -> str:
     if sw.is_residual:
         return "残留数据（软件本体未发现）"
+    if sw.status == "plugin_host_missing":
+        return "插件残留（宿主应用未安装）"
+    if sw.status == "plugin_body_missing":
+        return "插件数据（插件本体缺失）"
+    if sw.status == "plugin_not_installed":
+        return "配置中声明但尚未安装的插件"
+    if sw.is_plugin:
+        plugin_type = sw.metadata.get("plugin_type", "插件 / 扩展")
+        hosts = sw.metadata.get("host_apps") or [sw.metadata.get("host_app", "")]
+        host_text = "、".join(str(h) for h in hosts if h)
+        return f"{plugin_type}（宿主：{host_text}）" if host_text else str(plugin_type)
     if sw.status == "unregistered":
         return "只有程序文件 / 源码目录，未发现启动入口"
     explicit = sw.metadata.get("explicit")
@@ -1875,6 +2609,15 @@ def software_kind(sw: Software) -> str:
 def install_reason_explanation(sw: Software) -> str:
     if sw.is_residual:
         return "没有找到对应的软件本体；这里展示的是仍留在用户目录中的配置、数据或缓存。"
+    if sw.status == "plugin_host_missing":
+        return "插件本体或数据仍然存在，但它依赖的宿主应用没有检测到。它可能属于已经卸载或改名后的编辑器/浏览器。"
+    if sw.status == "plugin_body_missing":
+        return "插件配置或用户数据仍然存在，但没有找到插件本体目录。它不是普通独立软件残留，不能简单按应用数据删除。"
+    if sw.status == "plugin_not_installed":
+        return "编辑器配置中声明了这个插件，但插件管理器目录中没有找到本体，可能是配置保留了但插件尚未安装。"
+    if sw.is_plugin:
+        hosts = sw.metadata.get("host_apps") or [sw.metadata.get("host_app", "宿主应用")]
+        return f"这是安装在 {'、'.join(str(h) for h in hosts if h)} 中的扩展/插件，不是独立桌面软件。"
     if sw.status == "unregistered":
         return "程序文件或源码目录存在，但没有找到指向它的 .desktop 桌面入口或 ~/.local/bin 命令链接。它可能是构建目录、未完成安装的手动程序，或需要直接运行的可执行文件。"
     if sw.install_reason:
@@ -1966,6 +2709,25 @@ def package_cache(sw: Software) -> list[str]:
 def uninstall_plan(sw: Software) -> list[str]:
     manager = sw.metadata.get("manager")
     pkg = shlex.quote(sw.package_name) if sw.package_name else ""
+    if sw.method == "vim-plugin":
+        plugin_manager = sw.metadata.get("plugin_manager", "")
+        if plugin_manager == "vim-plug":
+            return ["# 从 Vim 配置中删除对应 Plug 行，然后执行: vim +PlugClean"]
+        if plugin_manager == "lazy.nvim":
+            return ["# 从 lazy.nvim 配置中删除该插件，然后重启 Neovim 执行 :Lazy clean"]
+        return ["# 在 Vim/Neovim 插件管理器或配置中移除该插件"]
+    if sw.method == "vscode-extension":
+        host = sw.metadata.get("host_app", "")
+        command = "codium" if "VSCodium" in host else "code"
+        return [f"{command} --uninstall-extension {pkg}"]
+    if sw.method == "browser-extension":
+        return ["# 在浏览器扩展管理页中移除对应扩展（扩展本体不要直接手删）"]
+    if sw.method == "browser-plugin":
+        commands = []
+        for artifact in sw.artifacts:
+            if artifact.path.endswith(".so") or artifact.path.endswith("flashplayer"):
+                commands.append(f"rm -f -- {shlex.quote(artifact.path)}")
+        return commands or ["# 在浏览器插件/兼容设置中停用或移除"]
     if manager == "pacman":
         return [f"sudo pacman -Rns -- {pkg}"]
     if manager == "dnf":
@@ -2070,13 +2832,44 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     def add(text: str = "", style: str = "normal") -> None:
         lines.append((text, style))
 
-    status_style = "danger" if sw.is_residual else ("warning" if sw.status == "unregistered" else "success")
+    status_style = (
+        "danger" if sw.is_residual or sw.status == "plugin_host_missing"
+        else "warning" if sw.status in {"unregistered", "plugin_body_missing", "plugin_not_installed"}
+        else "success"
+    )
     add(f"[{sw.status_label}] {sw.name}" + (f"  {sw.version}" if sw.version else ""), status_style)
     add(f"安装方式：{sw.method_title}")
     if sw.package_name:
         add(f"软件标识：{sw.package_name}")
     if sw.package_group:
         add(f"来源分组：{sw.package_group}")
+    if sw.is_plugin:
+        add("")
+        add("── 插件关系 ──", "title")
+        add(f"插件类型：{sw.metadata.get('plugin_type', '插件 / 扩展')}")
+        hosts = sw.metadata.get("host_apps") or [sw.metadata.get("host_app", "")]
+        host_text = "、".join(str(h) for h in hosts if h) or "未检测到"
+        add(f"宿主应用：{host_text}")
+        add(f"宿主状态：{'已安装' if sw.metadata.get('host_installed') else '未检测到'}")
+        if sw.metadata.get("plugin_manager"):
+            add(f"插件管理器：{sw.metadata['plugin_manager']}")
+        if sw.metadata.get("extension_id"):
+            add(f"扩展 ID：{sw.metadata['extension_id']}")
+        body_installed = sw.metadata.get("body_installed")
+        if body_installed is not None:
+            add(f"插件本体：{'已找到' if body_installed else '未找到'}", "success" if body_installed else "warning")
+        sub_extensions = sw.metadata.get("sub_extensions") or []
+        if sub_extensions:
+            add("包含的子扩展：")
+            for item in sub_extensions:
+                add(f"  - {item}")
+        extension_pack = sw.metadata.get("extension_pack") or []
+        if extension_pack:
+            add("扩展包包含：")
+            for item in extension_pack:
+                add(f"  - {item}")
+        if sw.metadata.get("active_status"):
+            add(f"运行状态：{sw.metadata['active_status']}", "warning")
 
     add("")
     add("── 软件介绍 ──", "title")
@@ -2107,7 +2900,7 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     files = package_files(sw)
     if files:
         add("")
-        add(f"包管理器登记的文件 / 目录（共 {len(files)} 项）", "subtitle")
+        add(f"登记的文件 / 目录（共 {len(files)} 项）", "subtitle")
         # Full list stays available in exported reports; the TUI groups it.
         groups: dict[str, int] = {}
         for path in files:
@@ -2134,7 +2927,7 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     add("")
     add("── 依赖关系 ──", "title")
     resolved_dependencies = list(dict.fromkeys(sw.dependencies + package_dependencies(sw)))
-    reverse = reverse_dependencies(sw)
+    reverse = list(dict.fromkeys(reverse_dependencies(sw) + plugin_reverse_dependencies(sw, inventory)))
     add("它需要哪些软件（正向依赖）：")
     if resolved_dependencies:
         for part in wrap_display("  " + ", ".join(resolved_dependencies), 100):
@@ -2186,6 +2979,13 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
     add("── 卸载 / 清理建议 ──", "title")
     if sw.is_residual:
         add("  软件本体未发现。可先按 d 删除下面列出的残留数据和缓存。", "warning")
+    elif sw.is_plugin:
+        if sw.status == "plugin_body_missing":
+            add("  插件本体缺失。d 只清理插件数据，不会自动删除编辑器配置。", "warning")
+        elif sw.status == "plugin_not_installed":
+            add("  插件尚未安装。d 可清理残留数据；通常应先重新安装或删除配置声明。", "warning")
+        else:
+            add("  插件应通过宿主应用的插件管理器卸载；d 默认只清理插件数据。", "dim")
     elif sw.method == "appimage":
         add("  AppImage 没有系统卸载器；d 会删除本体、启动入口及用户数据。", "warning")
     elif sw.method == "source":
@@ -2424,7 +3224,9 @@ class TUI:
 
     def filter_order(self, method: Method) -> list[str]:
         order = ["all"]
-        if self.method_supports_filters(method):
+        if method.id in {"editor-plugins", "browser-plugins"}:
+            order.extend(["installed_plugins", "missing_plugins", "host_missing"])
+        elif self.method_supports_filters(method):
             order.extend(["explicit", "deps"])
         if self.method_supports_foreign(method):
             order.append("foreign")
@@ -2439,6 +3241,12 @@ class TUI:
             items = [s for s in items if s.metadata.get("explicit") is False]
         elif self.list_filter == "foreign":
             items = [s for s in items if s.metadata.get("foreign")]
+        elif self.list_filter == "installed_plugins":
+            items = [s for s in items if s.status == "installed"]
+        elif self.list_filter == "missing_plugins":
+            items = [s for s in items if s.status in {"plugin_body_missing", "plugin_not_installed", "unregistered"}]
+        elif self.list_filter == "host_missing":
+            items = [s for s in items if s.status == "plugin_host_missing"]
         if self.search:
             q = self.search.casefold()
             items = [s for s in items if q in s.name.casefold() or q in s.summary.casefold() or q in s.package_name.casefold()]
@@ -2460,7 +3268,11 @@ class TUI:
         method = self.current_method()
         items = self.filtered_software(method)
         title_style = "danger" if method.residual else "subtitle"
-        filters = {"all": "全部", "explicit": "显式安装", "deps": "依赖包", "foreign": "第三方/本地"}
+        filters = {
+            "all": "全部", "explicit": "显式安装", "deps": "依赖包", "foreign": "第三方/本地",
+            "installed_plugins": "已安装插件", "missing_plugins": "插件本体缺失/未安装",
+            "host_missing": "宿主已卸载",
+        }
         self.header(stdscr, f"{method.title} · {filters.get(self.list_filter, '全部')}" + (f" · 搜索 {self.search}" if self.search else ""), f"{len(items)} / {len(method.softwares)} 个")
         legend = "● 已安装   ○ 无启动入口   ● 红色=残留   ｜ 主动=用户主动安装，依赖=随其他软件带入"
         self.put(stdscr, 3, 2, legend, max_x - 4, "dim")
@@ -2478,6 +3290,15 @@ class TUI:
                 if sw.is_residual:
                     style = "danger"
                     status = "● 残留"
+                elif sw.status == "plugin_host_missing":
+                    style = "danger"
+                    status = "● 宿主缺失"
+                elif sw.status == "plugin_body_missing":
+                    style = "warning"
+                    status = "○ 插件缺失"
+                elif sw.status == "plugin_not_installed":
+                    style = "warning"
+                    status = "○ 仅声明"
                 elif sw.status == "unregistered":
                     style = "warning"
                     status = "○ 无入口"
@@ -2492,6 +3313,8 @@ class TUI:
                     reason = "依赖"
                 elif sw.metadata.get("foreign"):
                     reason = "第三方"
+                elif sw.is_plugin:
+                    reason = "插件"
                 label = f" {status:<6} {sw.name}"
                 version = sw.version[:22]
                 right = f"{reason:<4} {version:>22}"
@@ -2501,7 +3324,7 @@ class TUI:
             self.put(stdscr, start_y + 2, 4, "没有匹配项。", max_x - 8, "warning")
         if method.residual:
             hint = "红色条目表示没有发现对应软件本体；Enter 查看路径"
-        elif self.method_supports_filters(method) or self.method_supports_foreign(method):
+        elif self.method_supports_filters(method) or self.method_supports_foreign(method) or method.id in {"editor-plugins", "browser-plugins"}:
             hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 搜索  f 筛选  e 导出清单  Esc 返回"
         else:
             hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 搜索  e 导出清单  Esc 返回"
@@ -2533,7 +3356,9 @@ class TUI:
         if sw.is_residual:
             extra = "  d 删除残留数据"
         elif cleanup_paths(sw):
-            if sw.method in {"appimage", "source"}:
+            if sw.is_plugin:
+                extra = "  d 清理插件数据"
+            elif sw.method in {"appimage", "source"}:
                 extra = "  d 卸载并清理"
             else:
                 extra = "  d 清理用户数据/缓存"

@@ -80,6 +80,80 @@ Install Reason  : Installed as a dependency for another package
             self.assertEqual(items[0].version, "2.1.0")
             self.assertEqual(items[0].dependencies, ["left-pad"])
 
+    def test_vim_coc_data_is_classified_as_plugin_not_plain_residual(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            cfg = home / ".vim/vimconfigs/plugins.vim"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text("Plug 'neoclide/coc.nvim', {'branch': 'release'}\n")
+            settings = home / ".vim/coc-settings.json"
+            settings.write_text("{}")
+            data = home / ".config/coc/extensions"
+            data.mkdir(parents=True)
+            (data / "package.json").write_text('{"dependencies":{"coc-json":">=1.0"}}')
+            plugins = sm.collect_vim_plugins(home)
+            coc = next(p for p in plugins if p.name == "coc.nvim")
+            self.assertEqual(coc.status, "plugin_body_missing")
+            self.assertEqual(coc.method, "vim-plugin")
+            self.assertTrue(any(a.path == str(home / ".config/coc") for a in coc.data_artifacts))
+            self.assertIn("coc-json", coc.metadata["sub_extensions"])
+
+    def test_vscode_extension_and_global_storage_are_linked(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            ext = home / ".vscode/extensions/ms-python.python-1.0.0"
+            ext.mkdir(parents=True)
+            (ext / "package.json").write_text('{"publisher":"ms-python","name":"python","displayName":"Python","version":"1.0.0","description":"Python support"}')
+            storage = home / ".config/Code/User/globalStorage/ms-python.python"
+            storage.mkdir(parents=True)
+            plugins = sm.collect_vscode_extensions(home)
+            python = next(p for p in plugins if p.package_name == "ms-python.python")
+            self.assertEqual(python.status, "installed")
+            self.assertEqual(python.version, "1.0.0")
+            self.assertTrue(any(a.path == str(storage) for a in python.data_artifacts))
+
+    def test_chromium_extension_manifest_and_storage_are_linked(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            ext = home / ".config/chromium/Default/Extensions/abcdefghijklmnop/1.2.0"
+            ext.mkdir(parents=True)
+            (ext / "manifest.json").write_text('{"name":"__MSG_name__","description":"Demo extension","version":"1.2.0","default_locale":"en"}')
+            locale = ext / "_locales/en"
+            locale.mkdir(parents=True)
+            (locale / "messages.json").write_text('{"name":{"message":"Demo Browser Extension"}}')
+            storage = home / ".config/chromium/Default/Local Extension Settings/abcdefghijklmnop"
+            storage.mkdir(parents=True)
+            plugins = sm.collect_browser_extensions(home)
+            chrome = next(p for p in plugins if p.package_name == "abcdefghijklmnop")
+            self.assertEqual(chrome.name, "Demo Browser Extension")
+            self.assertTrue(any(a.path == str(storage) for a in chrome.data_artifacts))
+
+    def test_plugin_reverse_dependencies(self):
+        base = sm.Software(
+            id="vscode-extension:vendor.base", name="Base", method="vscode-extension",
+            method_title="VS Code 扩展", package_name="vendor.base",
+            metadata={"plugin_type": "VS Code 扩展"},
+        )
+        dependent = sm.Software(
+            id="vscode-extension:vendor.extra", name="Extra", method="vscode-extension",
+            method_title="VS Code 扩展", package_name="vendor.extra",
+            dependencies=["vendor.base"], metadata={"plugin_type": "VS Code 扩展"},
+        )
+        inv = sm.Inventory("now", "host", "Linux", "/home/test", [sm.Method("editor", "Editor", "", [base, dependent])])
+        self.assertEqual(sm.plugin_reverse_dependencies(base, inv), ["Extra"])
+
+    def test_flash_is_browser_plugin_not_source_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            flash = home / ".application/flashplayer"
+            flash.parent.mkdir(parents=True)
+            flash.write_bytes(b"not-a-real-binary")
+            plugins = sm.collect_flash_plugins(home)
+            self.assertEqual(len(plugins), 1)
+            self.assertEqual(plugins[0].method, "browser-plugin")
+            self.assertIn("浏览器插件", plugins[0].metadata["plugin_type"])
+            self.assertTrue(any(a.path == str(flash) for a in plugins[0].artifacts))
+
     def test_uninstall_plans_for_native_managers(self):
         cases = {
             "apt": "sudo apt remove --purge demo",
