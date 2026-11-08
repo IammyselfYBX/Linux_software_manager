@@ -21,6 +21,7 @@ import argparse
 import configparser
 import curses
 import datetime as dt
+import difflib
 import glob
 import importlib.metadata as importlib_metadata
 import json
@@ -41,7 +42,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 APP_NAME = "Software Manager"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 STATE_DIR = Path.home() / ".local" / "state" / "software_manager"
 DELETE_LOG = STATE_DIR / "delete.log"
 
@@ -447,6 +448,57 @@ def alias_matches(entry_name: str, aliases: set[str]) -> bool:
         if len(n) >= 5 and len(alias) >= 5 and alias in n:
             return True
     return False
+
+
+def fuzzy_score(query: str, text: str) -> int:
+    """Return a relevance score for a global fuzzy software-name search."""
+    q = norm(query)
+    t = norm(text)
+    if not q or not t:
+        return 0
+    if t == q:
+        return 1000
+    if t.startswith(q):
+        return 920 - min(80, len(t) - len(q))
+    position = t.find(q)
+    if position >= 0:
+        return 850 - min(120, position * 4) - min(80, len(t) - len(q))
+    # Every query character appearing in order is useful for abbreviations
+    # such as "ztr" -> Zotero.
+    positions: list[int] = []
+    cursor = 0
+    for char in q:
+        found = t.find(char, cursor)
+        if found < 0:
+            positions = []
+            break
+        positions.append(found)
+        cursor = found + 1
+    if positions:
+        span = positions[-1] - positions[0] + 1
+        gaps = span - len(q)
+        return max(200, 620 - gaps * 25 - positions[0] * 2)
+    ratio = difflib.SequenceMatcher(None, q, t).ratio()
+    if ratio >= 0.45:
+        return int(350 * ratio)
+    return 0
+
+
+def search_software(inventory: Inventory, query: str) -> list[Software]:
+    if not norm(query):
+        return []
+    scored: list[tuple[int, int, str, Software]] = []
+    for software in inventory.all_software():
+        name_score = fuzzy_score(query, software.name)
+        package_score = fuzzy_score(query, software.package_name)
+        backend_score = fuzzy_score(query, software.method_title)
+        score = max(name_score, int(package_score * 0.95), int(backend_score * 0.45))
+        if score <= 0:
+            continue
+        status_priority = 0 if software.status == "installed" else 1
+        scored.append((score, status_priority, software.name.casefold(), software))
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [item[3] for item in scored]
 
 
 # ---------------------------------------------------------------------------
@@ -3185,9 +3237,15 @@ class TUI:
         self.method_offset = 0
         self.software_index = 0
         self.detail_scroll = 0
+        self.detail_software: Optional[Software] = None
+        self.detail_return_state = "list"
         self.state = "methods"
         self.list_filter = "all"
         self.search = ""
+        self.global_query = ""
+        self.global_results: list[Software] = []
+        self.global_index = 0
+        self.search_return_state = "methods"
         self.scan_note = ""
         self.detail_cache: dict[str, list[tuple[str, str]]] = {}
 
@@ -3258,8 +3316,119 @@ class TUI:
         else:
             self.put(stdscr, y, 0, text, max_x, "dim")
 
+    def start_global_search(self) -> None:
+        self.search_return_state = self.state
+        self.global_query = ""
+        self.global_results = []
+        self.global_index = 0
+        self.state = "search"
+
+    def update_global_results(self) -> None:
+        self.global_results = search_software(self.inventory, self.global_query)
+        self.global_index = min(self.global_index, max(0, len(self.global_results) - 1))
+
+    def open_detail(self, software: Software, return_state: str) -> None:
+        self.detail_software = software
+        self.detail_return_state = return_state
+        self.detail_scroll = 0
+        self.state = "detail"
+
+    @staticmethod
+    def visual_status(sw: Software) -> tuple[str, str]:
+        if sw.is_residual:
+            return "danger", "● 残留"
+        if sw.status == "plugin_host_missing":
+            return "danger", "● 宿主缺失"
+        if sw.status == "plugin_body_missing":
+            return "warning", "○ 插件缺失"
+        if sw.status == "plugin_not_installed":
+            return "warning", "○ 仅声明"
+        if sw.status == "unregistered":
+            return "warning", "○ 无入口"
+        return "normal", "● 已安装"
+
+    def draw_search(self, stdscr) -> None:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+        curses.curs_set(1)
+        self.header(stdscr, "全局软件模糊搜索", f"{len(self.global_results)} 个结果")
+        prompt = "搜索: "
+        self.put(stdscr, 4, 2, prompt + self.global_query, max_x - 4, "warning")
+        cursor_x = 2 + display_width(prompt + self.global_query)
+        try:
+            stdscr.move(4, min(max_x - 1, cursor_x))
+        except curses.error:
+            pass
+        results_y = 6
+        page = max(1, max_y - results_y - 3)
+        if self.global_results:
+            self.global_index = min(max(0, self.global_index), len(self.global_results) - 1)
+            offset = max(0, min(self.global_index - page + 1, len(self.global_results) - page))
+            for row, idx in enumerate(range(offset, min(len(self.global_results), offset + page))):
+                sw = self.global_results[idx]
+                selected = idx == self.global_index
+                style, status = self.visual_status(sw)
+                method = sw.method_title.replace("系统包管理器 · ", "")
+                label = f" {status:<8} {sw.name}"
+                right = f"{method[:26]:>28}"
+                line = pad_display(label, max(20, max_x - 31)) + right
+                self.put(stdscr, results_y + row, 1, line, max_x - 2, style, selected=selected)
+            selected_sw = self.global_results[self.global_index]
+            detail_hint = f"当前：{selected_sw.method_title}  {selected_sw.version}"
+            self.put(stdscr, max_y - 3, 2, detail_hint, max_x - 4, "dim")
+        elif self.global_query:
+            self.put(stdscr, results_y + 1, 4, "没有匹配的软件名称。", max_x - 8, "warning")
+        else:
+            self.put(stdscr, results_y + 1, 4, "直接输入软件名称或缩写，例如：zot、fire、coc、python", max_x - 8, "dim")
+        self.footer(stdscr, "输入名称  ↑↓/PgUp/PgDn 选择  Enter 查看详情  Ctrl-U 清空  Esc 返回")
+
+    def handle_global_search(self, stdscr, ch: Any) -> None:
+        if isinstance(ch, str):
+            if ch in ("\n", "\r"):
+                ch = curses.KEY_ENTER
+            elif ch in ("\x7f", "\b", "\x08"):
+                ch = curses.KEY_BACKSPACE
+            elif ch == "\x1b":
+                ch = 27
+            elif ch == "\x15":
+                self.global_query = ""
+                self.global_index = 0
+                self.update_global_results()
+                return
+            elif ch.isprintable():
+                self.global_query += ch
+                self.global_index = 0
+                self.update_global_results()
+                return
+            else:
+                return
+        if ch == 27:
+            self.state = self.search_return_state
+            return
+        page = max(1, stdscr.getmaxyx()[0] - 9)
+        if ch in (curses.KEY_UP, ord("k")):
+            self.global_index = max(0, self.global_index - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            self.global_index = min(max(0, len(self.global_results) - 1), self.global_index + 1)
+        elif ch == curses.KEY_PPAGE:
+            self.global_index = max(0, self.global_index - page)
+        elif ch == curses.KEY_NPAGE:
+            self.global_index = min(max(0, len(self.global_results) - 1), self.global_index + page)
+        elif ch == curses.KEY_HOME:
+            self.global_index = 0
+        elif ch == curses.KEY_END:
+            self.global_index = max(0, len(self.global_results) - 1)
+        elif ch in (curses.KEY_BACKSPACE, 8, 127):
+            if self.global_query:
+                self.global_query = self.global_query[:-1]
+                self.global_index = 0
+                self.update_global_results()
+        elif ch in (10, 13, curses.KEY_ENTER) and self.global_results:
+            self.open_detail(self.global_results[self.global_index], "search")
+
     def draw_methods(self, stdscr) -> None:
         stdscr.erase()
+        curses.curs_set(0)
         max_y, max_x = stdscr.getmaxyx()
         counts = self.inventory.counts()
         total = sum(counts.values())
@@ -3294,7 +3463,7 @@ class TUI:
             else:
                 style = "dim"
             self.put(stdscr, max_y - 3, 2, desc, max_x - 4, style)
-        self.footer(stdscr, "↑↓ 选择  Enter 进入  1-9 直选  r 重新扫描  q 退出")
+        self.footer(stdscr, "↑↓ 选择  Enter 进入  / 或 s 全局模糊搜索  1-9 直选  r 重新扫描  q 退出")
 
     @staticmethod
     def method_supports_filters(method: Method) -> bool:
@@ -3346,6 +3515,7 @@ class TUI:
 
     def draw_list(self, stdscr) -> None:
         stdscr.erase()
+        curses.curs_set(0)
         max_y, max_x = stdscr.getmaxyx()
         method = self.current_method()
         items = self.filtered_software(method)
@@ -3407,15 +3577,16 @@ class TUI:
         if method.residual:
             hint = "红色条目表示没有发现对应软件本体；Enter 查看路径"
         elif self.method_supports_filters(method) or self.method_supports_foreign(method) or method.id in {"editor-plugins", "browser-plugins"}:
-            hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 搜索  f 筛选  e 导出清单  Esc 返回"
+            hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 本页搜索  S 全局搜索  f 筛选  e 导出  Esc 返回"
         else:
-            hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 搜索  e 导出清单  Esc 返回"
+            hint = "↑↓/PgUp/PgDn 移动  Enter 详情  / 本页搜索  S 全局搜索  e 导出  Esc 返回"
         self.footer(stdscr, hint)
 
     def draw_detail(self, stdscr) -> None:
         stdscr.erase()
+        curses.curs_set(0)
         max_y, max_x = stdscr.getmaxyx()
-        sw = self.current_software()
+        sw = self.detail_software or self.current_software()
         if not sw:
             self.footer(stdscr, "没有可显示的项目，Esc 返回")
             return
@@ -3444,7 +3615,7 @@ class TUI:
                 extra = "  d 卸载并清理"
             else:
                 extra = "  d 清理用户数据/缓存"
-        self.footer(stdscr, f"↑↓/PgUp/PgDn 滚动  e 导出详情{extra}  Esc 返回  q 退出")
+        self.footer(stdscr, f"↑↓/PgUp/PgDn 滚动  e 导出详情{extra}  S 全局搜索  Esc 返回  q 退出")
 
     def confirm(self, stdscr, question: str) -> bool:
         max_y, max_x = stdscr.getmaxyx()
@@ -3517,13 +3688,23 @@ class TUI:
                 self.draw_methods(stdscr)
             elif self.state == "list":
                 self.draw_list(stdscr)
+            elif self.state == "search":
+                self.draw_search(stdscr)
             else:
                 self.draw_detail(stdscr)
             stdscr.refresh()
-            ch = stdscr.getch()
+            if self.state == "search":
+                try:
+                    ch = stdscr.get_wch()
+                except curses.error:
+                    continue
+            else:
+                ch = stdscr.getch()
             if ch == -1:
                 continue
-            if self.state == "methods":
+            if self.state == "search":
+                self.handle_global_search(stdscr, ch)
+            elif self.state == "methods":
                 if ch in (ord("q"), 27):
                     return
                 if ch in (curses.KEY_UP, ord("k")):
@@ -3543,6 +3724,8 @@ class TUI:
                         self.software_index = 0
                         self.list_filter = "all"
                         self.search = ""
+                elif ch in (ord("/"), ord("s")):
+                    self.start_global_search()
                 elif ch == ord("r"):
                     self.inventory = self.refresh_cb()
                     self.detail_cache.clear()
@@ -3567,8 +3750,9 @@ class TUI:
                 elif ch == curses.KEY_END:
                     self.software_index = max(0, len(items) - 1)
                 elif ch in (10, 13, curses.KEY_ENTER) and items:
-                    self.state = "detail"
-                    self.detail_scroll = 0
+                    self.open_detail(items[self.software_index], "list")
+                elif ch == ord("S"):
+                    self.start_global_search()
                 elif ch == ord("/"):
                     self.ask_search(stdscr)
                 elif ch == ord("f"):
@@ -3585,15 +3769,17 @@ class TUI:
                     self.method_index = min(self.method_index, len(self.inventory.methods) - 1)
                     self.software_index = 0
             else:
-                sw = self.current_software()
+                sw = self.detail_software or self.current_software()
                 if not sw:
                     self.state = "list"
                     continue
                 page = max(1, stdscr.getmaxyx()[0] - 7)
-                if ch in (27,):
-                    self.state = "list"
+                if ch == 27:
+                    self.state = self.detail_return_state
                 elif ch == ord("q"):
                     return
+                elif ch == ord("S"):
+                    self.start_global_search()
                 elif ch in (curses.KEY_UP, ord("k")):
                     self.detail_scroll = max(0, self.detail_scroll - 1)
                 elif ch in (curses.KEY_DOWN, ord("j")):

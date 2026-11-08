@@ -68,6 +68,29 @@ Install Reason  : Installed as a dependency for another package
         )
         self.assertEqual(sm.reverse_dependencies(sw), ["player", "editor"])
 
+    def test_global_fuzzy_search_supports_prefix_and_abbreviation(self):
+        self.assertGreater(sm.fuzzy_score("zot", "Zotero"), 0)
+        self.assertGreater(sm.fuzzy_score("ztr", "Zotero"), 0)
+        self.assertEqual(sm.fuzzy_score("zzzz", "Zotero"), 0)
+
+        zotero = sm.Software(
+            id="manual:zotero", name="Zotero", method="source",
+            method_title="源码 / 手动安装", status="installed",
+        )
+        python = sm.Software(
+            id="apt:python3", name="python3", method="apt",
+            method_title="系统包管理器 · apt/dpkg", status="installed",
+        )
+        missing = sm.Software(
+            id="residual:zotero-old", name="Zotero Old Data", method="residual",
+            method_title="残留", status="residual",
+        )
+        inv = sm.Inventory("now", "host", "Linux", "/home/test", [sm.Method("all", "All", "", [python, zotero, missing])])
+        results = sm.search_software(inv, "zot")
+        self.assertEqual(results[0].name, "Zotero")
+        self.assertIn("Zotero Old Data", [item.name for item in results])
+        self.assertEqual(sm.search_software(inv, ""), [])
+
     def test_node_modules_scanner_reads_manifest_without_npm(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "node_modules"
