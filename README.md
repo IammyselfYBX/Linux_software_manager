@@ -88,6 +88,43 @@
 
 Flash 会归入“浏览器插件”，不会再作为普通源码目录列出。详情页会标注宿主浏览器、NPAPI/PPAPI 类型以及 Flash 已停止支持的状态。
 
+### 源码 / 手动安装 / 自更新应用
+
+除了源码目录之外，还会识别不经过系统包管理器的完整应用目录：
+
+- `~/.application/*`
+- `~/.local/opt/*`
+- `~/opt/*`
+- `~/Zotero_linux-x86_64`
+- `~/.local/bin` 命令链接指向的其他用户目录
+
+如果应用根目录包含 `application.ini`，会读取真实的 `Name`、`Version`、`Vendor`、`AppUpdate.URL` 等字段，而不是只看目录名。
+
+支持标注应用内自更新：
+
+- Mozilla MAR 完整更新包
+- Electron autoUpdater / `app-update.yml`
+
+例如 Zotero 升级后移动到：
+
+```text
+~/.local/opt/zotero/
+├── zotero
+├── app/application.ini
+└── updates/
+```
+
+程序仍会识别为：
+
+```text
+Zotero 10.0.7
+安装根目录：~/.local/opt/zotero
+命令链接：~/.local/bin/zotero
+桌面入口：~/.local/share/applications/zotero.desktop
+更新方式：Mozilla MAR / 应用内完整更新包
+更新目录：~/.local/opt/zotero/updates
+```
+
 ### 语言级包管理器
 
 - Python：`pip --user`、`pipx`

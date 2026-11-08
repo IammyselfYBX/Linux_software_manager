@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 APP_NAME = "Software Manager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 STATE_DIR = Path.home() / ".local" / "state" / "software_manager"
 DELETE_LOG = STATE_DIR / "delete.log"
 
@@ -1806,6 +1806,43 @@ def collect_appimages(home: Path, desktop: list[dict[str, str]], local_bins: lis
     return result
 
 
+def application_ini_info(root: Path) -> dict[str, str]:
+    for candidate in (root / "application.ini", root / "app/application.ini"):
+        if not candidate.is_file():
+            continue
+        info: dict[str, str] = {}
+        section = ""
+        for raw in _read_small_text(candidate, 20_000).splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+            elif "=" in line and not line.startswith(("#", ";")):
+                key, value = line.split("=", 1)
+                info[f"{section}.{key}" if section else key] = value.strip()
+        return info
+    return {}
+
+
+def manual_update_metadata(root: Path, app_info: dict[str, str]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    update_url = app_info.get("AppUpdate.URL", "")
+    updates_dir = root / "updates"
+    electron_update = next((p for p in (root / "resources/app-update.yml", root / "app-update.yml", root / "resources/app-update.yaml") if p.is_file()), None)
+    mar_files = sorted(glob.glob(str(root / "**/*.mar"), recursive=True))[:20]
+    if update_url or updates_dir.is_dir() or mar_files:
+        metadata["self_updating"] = True
+        metadata["update_system"] = "Mozilla MAR / 应用内完整更新包"
+        if updates_dir.is_dir():
+            metadata["update_directory"] = str(updates_dir)
+        if mar_files:
+            metadata["mar_files"] = mar_files
+    elif electron_update:
+        metadata["self_updating"] = True
+        metadata["update_system"] = "Electron autoUpdater"
+        metadata["update_config"] = str(electron_update)
+    return metadata
+
+
 def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins: list[dict[str, str]]) -> list[Software]:
     groups: dict[str, dict[str, Any]] = {}
 
@@ -1842,7 +1879,10 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
         home_real = os.path.realpath(home)
         candidates = [
             (home_real + "/.application/", 1),
+            (home_real + "/.local/opt/", 1),
+            (home_real + "/.local/apps/", 1),
             (home_real + "/.local/src/", 1),
+            (home_real + "/opt/", 1),
             (home_real + "/Qt", 1),
             ("/opt/", 1),
             ("/usr/local/src/", 1),
@@ -1860,6 +1900,11 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
             if root in {home_real, home_real + "/.local"}:
                 return None
             return root
+        if real.startswith(home_real + "/") and os.path.isfile(real):
+            parent = str(Path(real).parent)
+            if parent in {home_real, home_real + "/.local/bin"}:
+                return None
+            return parent
         return None
 
     # 1) ~/.local/bin symlinks and regular user scripts.
@@ -1920,6 +1965,7 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
             root, name,
             artifact=Artifact("桌面入口", entry["path"], note=f"Exec={entry.get('Exec', '')}"),
             alias_source=Path(ex).name,
+            summary=entry.get("Comment", ""),
         )
 
     # 3) /opt and /usr/local: find non-package-manager programs.
@@ -1975,9 +2021,15 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
             group["artifacts"].append(Artifact("本地命令", str(p)))
             group["aliases"].update(candidate_aliases(p.name))
 
-    # 4) Top-level source/build directories that have no launcher entry.
-    application_root = home / ".application"
-    if application_root.is_dir():
+    # 4) Top-level source/build/manual application directories without a launcher entry.
+    app_roots = [
+        (home / ".application", "源码 / 解压目录"),
+        (home / ".local/opt", "手动安装目录"),
+        (home / "opt", "手动安装目录"),
+    ]
+    for application_root, role in app_roots:
+        if not application_root.is_dir():
+            continue
         known_keys = list(groups)
         for p in application_root.iterdir():
             if not p.is_dir() or p.name == "software_manager":
@@ -1993,7 +2045,7 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
                 pass
             add(
                 str(p), p.name,
-                artifact=Artifact("源码 / 解压目录", str(p), note="未发现桌面入口或命令链接"),
+                artifact=Artifact(role, str(p), note="未发现桌面入口或命令链接"),
                 alias_source=p.name,
                 status="unregistered",
                 summary="存在源码或手动安装目录，但没有发现启动入口",
@@ -2004,30 +2056,43 @@ def collect_source_manual(home: Path, desktop: list[dict[str, str]], local_bins:
         if not group["artifacts"] or not os.path.exists(key):
             continue
         name = group["name"]
-        version = ""
-        for marker in (Path(key) / "version", Path(key) / "VERSION", Path(key) / "package.json"):
-            if marker.is_file():
-                try:
-                    text = marker.read_text(errors="replace")[:2000]
-                    m = re.search(r"(?im)(?:version[\"']?\s*[:=]\s*[\"']?|^v?)(\d+(?:\.\d+){1,4})", text)
-                    if m:
-                        version = m.group(1)
-                        break
-                except OSError:
-                    pass
+        root_path = Path(key)
+        app_info = application_ini_info(root_path)
+        version = app_info.get("App.Version", "")
+        if not version:
+            for marker in (root_path / "version", root_path / "VERSION", root_path / "package.json"):
+                if marker.is_file():
+                    try:
+                        text = marker.read_text(errors="replace")[:2000]
+                        m = re.search(r"(?im)(?:version[\"']?\s*[:=]\s*[\"']?|^v?)(\d+(?:\.\d+){1,4})", text)
+                        if m:
+                            version = m.group(1)
+                            break
+                    except OSError:
+                        pass
+        metadata: dict[str, Any] = {
+            "install_root": key,
+            "explicit": group.get("status", "installed") == "installed",
+            "application_id": app_info.get("App.ID", ""),
+            "vendor": app_info.get("App.Vendor", ""),
+        }
+        metadata.update(manual_update_metadata(root_path, app_info))
         sw = Software(
-            id=f"manual:{key}", name=name, method="source",
-            method_title="源码 / 手动安装", version=version,
+            id=f"manual:{key}", name=app_info.get("App.Name", name), method="source",
+            method_title="源码 / 手动安装 / 自更新应用", version=version,
             status=group.get("status", "installed"),
             summary=group.get("summary") or key,
             aliases=sorted(group["aliases"]),
-            metadata={"install_root": key},
+            metadata=metadata,
         )
         # The install root is the real program body for a source/manual app.
         # Aggregate tool directories are containers and must not be removed as
         # one unit.
         if key not in {str(home / ".local/bin"), "/usr/local/bin"}:
             sw.artifacts.append(Artifact("安装根目录", key))
+        update_directory = metadata.get("update_directory")
+        if update_directory and os.path.isdir(update_directory):
+            sw.artifacts.append(Artifact("自更新缓存目录", update_directory, size=path_size(update_directory)))
         seen = set()
         for artifact in group["artifacts"]:
             token = (artifact.role, artifact.path)
@@ -2843,6 +2908,23 @@ def detail_lines(sw: Software, inventory: Inventory) -> list[tuple[str, str]]:
         add(f"软件标识：{sw.package_name}")
     if sw.package_group:
         add(f"来源分组：{sw.package_group}")
+    if sw.metadata.get("self_updating"):
+        add("")
+        add("── 安装 / 更新方式 ──", "title")
+        add(f"更新方式：{sw.metadata.get('update_system', '应用内自更新')}")
+        if sw.metadata.get("application_id"):
+            add(f"应用 ID：{sw.metadata['application_id']}")
+        if sw.metadata.get("vendor"):
+            add(f"发布者：{sw.metadata['vendor']}")
+        if sw.metadata.get("update_directory"):
+            add(f"更新目录：{sw.metadata['update_directory']}", "dim")
+        mar_files = sw.metadata.get("mar_files") or []
+        if mar_files:
+            add("发现的 MAR 更新包：", "subtitle")
+            for mar_file in mar_files:
+                add(f"  - {mar_file}")
+        if sw.metadata.get("update_config"):
+            add(f"更新配置：{sw.metadata['update_config']}", "dim")
     if sw.is_plugin:
         add("")
         add("── 插件关系 ──", "title")

@@ -154,6 +154,39 @@ Install Reason  : Installed as a dependency for another package
             self.assertIn("浏览器插件", plugins[0].metadata["plugin_type"])
             self.assertTrue(any(a.path == str(flash) for a in plugins[0].artifacts))
 
+    def test_zotero_local_opt_self_updating_app_is_detected(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            zotero = home / ".local/opt/zotero"
+            zotero.mkdir(parents=True)
+            (zotero / "zotero").write_text("#!/bin/sh\n")
+            (zotero / "app").mkdir()
+            (zotero / "app/application.ini").write_text(
+                "[App]\nName=Zotero\nVersion=10.0.7\nID=zotero@zotero.org\nVendor=Zotero\n"
+                "[AppUpdate]\nURL=https://example.invalid/update.xml\n"
+            )
+            (zotero / "updates/0").mkdir(parents=True)
+            launcher = home / ".local/bin/zotero"
+            launcher.parent.mkdir(parents=True)
+            launcher.symlink_to(zotero / "zotero")
+            desktop_path = home / ".local/share/applications/zotero.desktop"
+            desktop_path.parent.mkdir(parents=True)
+            desktop_path.write_text("[Desktop Entry]\nName=Zotero\nComment=Reference manager\nExec=" + str(zotero / "zotero") + " -url %U\n")
+            desktop = [{
+                "path": str(desktop_path), "Name": "Zotero", "Comment": "Reference manager",
+                "Exec": str(zotero / "zotero") + " -url %U",
+            }]
+            local_bins = [{"launcher": str(launcher), "target": str(zotero / "zotero")}]
+            items = sm.collect_source_manual(home, desktop, local_bins)
+            app = next(s for s in items if s.name == "Zotero")
+            self.assertEqual(app.version, "10.0.7")
+            self.assertEqual(app.summary, "Reference manager")
+            self.assertEqual(app.metadata["install_root"], str(zotero.resolve()))
+            self.assertTrue(app.metadata["self_updating"])
+            self.assertIn("MAR", app.metadata["update_system"])
+            text = "\n".join(line for line, _ in sm.detail_lines(app, sm.Inventory("now", "host", "Linux", td, [])))
+            self.assertIn("Mozilla MAR", text)
+
     def test_uninstall_plans_for_native_managers(self):
         cases = {
             "apt": "sudo apt remove --purge demo",
